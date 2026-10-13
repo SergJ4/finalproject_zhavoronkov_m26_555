@@ -1,303 +1,320 @@
-import re
 from datetime import datetime, timedelta
 from uuid import uuid4 as uuid
 
-from valutatrade_hub.core.models import User, Portfolio, USD
+from valutatrade_hub.core.currencies import get_currency
+from valutatrade_hub.core.exceptions import UserNotFoundError
+from valutatrade_hub.core.models import (
+    BuyOrSellResult,
+    Portfolio,
+    ShowPortfolioResult,
+    User,
+)
 from valutatrade_hub.core.utils import load_rates
+from valutatrade_hub.decorators import log_action
+from valutatrade_hub.infra.database import DatabaseManager
+from valutatrade_hub.infra.settings import SettingsLoader
 
-__current_user: User | None = None
-__currency_pattern = re.compile(r'^[A-Z]{3}$')
 __UPDATED_AT_RATE_KEY = "updated_at"
 __RATE_KEY = "rate"
-__REFRESH_RATE_TIME_DELTA = 5
+__USD = "USD"
 
 
-def register(
-        username: str,
-        password: str,
-        users: list[User],
-        portfolios: list[Portfolio],
-) -> tuple[list[User], list[Portfolio]]:
+@log_action(action="REGISTER")
+def register(username: str, password: str) -> int:
     """
     Создает нового пользователя и сохраняет его в БД
     Args:
         username: имя нового пользователя
         password: пароль нового пользователя
-        users: список текущих зарегестрированных пользователей
-        portfolios: список текущих портфелей
     Returns:
-        Обновленные списки пользователей и портфелей
+        user_id нового зарегистрированного пользователя
+    Raises:
+        ValueError: если имя пользователя занято или пароль менее 4х символов
     """
 
-    for user in users:
-        if user.username == username:
-            print(f"Имя пользователя {username} уже занято")
-            return users, portfolios
+    database = DatabaseManager()
 
-    try:
+    new_user = None
+    with database.update_users() as users:
+        for user in users:
+            if user.username == username:
+                raise ValueError(f"Имя пользователя {username} уже занято")
+
         User.validate_password(password)
-    except (ValueError, TypeError) as e:
-        print(e)
-        return users, portfolios
 
-    salt = str(uuid())
-    user = User(
-        user_id=len(users) + 1,
-        username=username,
-        hashed_password=User.hash_password(password, salt),
-        salt=salt,
-        registration_date=datetime.now(),
-    )
-    new_users = users.copy()
-    new_users.append(user)
+        salt = str(uuid())
+        user = User(
+            user_id=len(users) + 1,
+            username=username,
+            hashed_password=User.hash_password(password, salt),
+            salt=salt,
+            registration_date=datetime.now(),
+        )
+        users.append(user)
+        new_user = user
 
-    user_portfolio = Portfolio(
-        user_id=user.user_id,
-        wallets={},
-        user=user,
-    )
-    new_portfolios = portfolios.copy()
-    new_portfolios.append(user_portfolio)
+    with database.update_portfolios() as portfolios:
+        user_portfolio = Portfolio(
+            user_id=new_user.user_id,
+            wallets={},
+            user=new_user,
+        )
+        portfolios.append(user_portfolio)
 
-    print(f"Пользователь '{username}' зарегистрирован (id={user.user_id}). "
-          f"Войдите: login --username {username} --password {'*' * len(password)}")
-
-    return new_users, new_portfolios
+    return new_user.user_id
 
 
-def login(
-        username: str,
-        password: str,
-        users: list[User]
-):
+@log_action(action="LOGIN")
+def login(username: str, password: str) -> User:
     """
     Войти и зафиксировать текущую сессию.
     Args:
-         username: имя пользователя
-         password: пароль пользователя
-         users: список текущих зарегестрированных пользователей
+        username: имя пользователя
+        password: пароль пользователя
+    Returns:
+        Объект User залогиненного пользователя
+    Raises:
+        ValueError: если неверный пароль
+        UserNotFoundError: если пользователь не зарегистрирован
     """
+    users = DatabaseManager().load_users()
     for user in users:
         if user.username == username:
             if user.verify_password(password):
-                global __current_user
-                __current_user = user
-                print(f"Вы вошли как '{username}'")
+                return user
             else:
-                print("Неверный пароль")
-            return
+                raise ValueError("Неверный пароль")
 
-    print(f"Пользователь '{username}' не найден")
-
-
-def __check_login() -> bool:
-    """
-    Проверяет есть ли залогиненый user
-    Returns:
-        True, если есть залогиненый пользователь. Иначе False
-    """
-    if __current_user is None:
-        print("Сначала выполните login")
-        return False
-    return True
+    raise UserNotFoundError(f"Пользователь '{username}' не найден")
 
 
-def __find_user_portfolio(portfolios: list[Portfolio]) -> Portfolio | None:
+def __find_user_portfolio(portfolios: list[Portfolio], user_id: int) -> Portfolio:
     """
     Ищет в списке портфелей один портфель, пренадлежащий текущему
     залогиненному пользователю
 
-    !!! НЕ проверяет имеется ли сейчас пользовательская сессия !!!
     Args:
          portfolios: список всех портфелей из БД
+         user_id: id пользователя, чей портфель надо найти
     Returns:
         Если найден - возвращает портфель. Иначе None
+    Raises:
+        ValueError: если не нашли портфель для пользователя
     """
     for portfolio in portfolios:
-        if portfolio.user.user_id == __current_user.user_id:
+        if isinstance(portfolio.user, int) and portfolio.user == user_id:
             return portfolio
+
+        if isinstance(portfolio.user, User) and portfolio.user.user_id == user_id:
+            return portfolio
+
     # Такого быть не должно, если только повредили json файл
-    print(f"Не нашел portfolio для '{__current_user.username}'")
-    return None
-
-
-def __validate_currency_code(currency_code: str):
-    """
-    Валидирует код валюты на количество символов и тип (строка)
-    Raises:
-         ValueError: если currency_code не строка из трех латинских заглавных букв
-    """
-    if (not isinstance(currency_code, str) or
-            __currency_pattern.match(currency_code) is None
-    ):
-        raise ValueError("Код валюты должен быть строкой из "
-                         "трех латинских заглавных букв")
+    raise ValueError(f"Не нашел portfolio для пользователя с id='{user_id}'")
 
 
 def show_portfolio(
-        portfolios: list[Portfolio],
-        base_currency: str = USD
-):
+        base_currency: str,
+        user: User,
+) -> ShowPortfolioResult:
     """
     Показывает все кошельки и итоговую стоимость в базовой валюте (по умолчанию USD)
     Args:
-        portfolios: список всех портфелей из БД
         base_currency: валюта в которой надо вывести итоговую стоимость
+        user: залогиненный user
+    Raises:
+        ValueError: если код валюты не строка из трех латинских заглавных букв,
+                    или не удалось получить курс валют для конвертации,
+                    или не нашли портфель пользователя,
+                    или у пользователя нет кошельков
+        CurrencyNotFoundError: если код базовой валюты не найден
     """
-    if not __check_login():
-        return
-    try:
-        __validate_currency_code(base_currency)
-    except ValueError as e:
-        print(e)
-        return
+    get_currency(base_currency)
 
-    user_portfolio = __find_user_portfolio(portfolios)
+    database = DatabaseManager()
+    portfolios = database.load_portfolios()
 
-    if user_portfolio is None:
-        return
+    user_portfolio = __find_user_portfolio(portfolios, user.user_id)
 
-    print(f"Портфель пользователя '{__current_user.username}' (база: {base_currency}):")
+    if len(user_portfolio.wallets) == 0:
+        raise ValueError(f"У пользователя {user.username} нет кошельков")
+
+    wallets_data = []
     total = 0
     for currency, wallet in user_portfolio.wallets.items():
         try:
-            rate = get_rate(
+            rate = __get_rate(
                 from_currency_code=currency,
                 to_currency_code=base_currency,
+                base_currency=base_currency,
             )
         except KeyError:
-            print(f"Неизвестная базовая валюта '{base_currency}'")
-            return
+            raise ValueError(f"Не удалось получить курс для {currency}→{base_currency}")
 
-        converted_to_base = round(wallet.balance * rate, 2)
+        converted_to_base = wallet.balance * rate
         total += converted_to_base
-        print(f"- {currency}: {wallet.balance} → {converted_to_base:.2f} {base_currency}")
+        wallets_data.append((currency, wallet.balance, converted_to_base))
 
-    print("---------------------------------")
-    print(f"ИТОГО: {round(total, 2):,.2f} {base_currency}")
+    return ShowPortfolioResult(
+        wallet_infos=wallets_data,
+        total=total,
+    )
 
 
+@log_action(action="BUY", verbose=True)
 def buy(
-        currency_code: str,
-        amount: float,
-        portfolios: list[Portfolio],
-):
+    user_id: int,
+    currency_code: str,
+    amount: float,
+    username: str = "",
+) -> BuyOrSellResult:
     """
     Купить валюту
 
-    !!! Функция ИЗМЕНЯЕТ переданный в нее список portfolios, но не сохраняет его !!!
     Args:
+          user_id: id залогиненого пользователя
           currency_code: код покупаемой валюты
           amount: количество покупаемой валюты (в штуках, не в долларах)
-          portfolios: список всех портфелей из БД
+          username: имя залогиненого пользователя (здесь нужен для логирования)
+    Raises:
+        ValueError: если код валюты не строка из трех латинских заглавных букв,
+                    или не удалось получить курс валют для конвертации,
+                    или amount не положительное число
+        CurrencyNotFoundError: Если код валюты не найден
     """
-    if not __check_login():
-        return
+    get_currency(currency_code)
 
-    try:
-        __validate_currency_code(currency_code)
-    except ValueError as e:
-        print(e)
-        return
+    with DatabaseManager().update_portfolios() as portfolios:
+        user_portfolio = __find_user_portfolio(portfolios, user_id)
 
-    user_portfolio = __find_user_portfolio(portfolios)
-    if user_portfolio is None:
-        return
+        if currency_code not in user_portfolio.wallets:
+            user_portfolio.add_currency(currency_code)
 
-    if currency_code not in user_portfolio.wallets:
-        user_portfolio.add_currency(currency_code)
-
-    wallet = user_portfolio.get_wallet(currency_code)
-    sum_before_deposit = wallet.balance
-    try:
+        wallet = user_portfolio.get_wallet(currency_code)
+        sum_before_deposit = wallet.balance
         wallet.deposit(amount)
-    except ValueError as e:
-        print(e)
-        return
+
+    base_currency = SettingsLoader().get(
+        key=SettingsLoader.DEFAULT_BASE_CURRENCY_KEY, default=__USD
+    )
 
     try:
-        if currency_code == USD:
-            rate = 1
-        else:
-            rate = get_rate(currency_code, USD)
-        converted_to_base = round(amount * rate, 2)
+        rate = __get_rate(
+            from_currency_code=currency_code,
+            to_currency_code=base_currency,
+            base_currency=base_currency,
+        )
+    except KeyError:
+        raise ValueError(
+            f"Не удалось получить курс для {currency_code}→{base_currency}"
+        )
 
-        print(f"Покупка выполнена: {amount} {currency_code} "
-              f"по курсу {rate} USD/{currency_code}")
-        print("Изменения в портфеле:")
-        print(f"- {currency_code}: было {sum_before_deposit} → стало {wallet.balance}")
-        print(f"Оценочная стоимость покупки {converted_to_base:,.2f} USD")
-    except ValueError as e:
-        print(e)
-    except KeyError as e:
-        print(f"Не удалось получить курс для {currency_code}→USD")
+    converted_to_base = amount * rate
+
+    return BuyOrSellResult(
+        rate=rate,
+        base_currency=base_currency,
+        total_cost=converted_to_base,
+        sum_before_operation=sum_before_deposit,
+        sum_after_operation=wallet.balance,
+    )
 
 
+@log_action(action="SELL")
 def sell(
-        currency_code: str,
-        amount: float,
-        portfolios: list[Portfolio]
+    user_id: int,
+    currency_code: str,
+    amount: float,
+    username: str = "",
 ):
     """
     Продать указанную валюту.
-
-    !!! Функция ИЗМЕНЯЕТ переданный в нее список portfolios, но не сохраняет его !!!
     Args:
+          user_id: id залогиненого пользователя
           currency_code: код валюты на продажу
           amount: количество продаваемой валюты (в штуках, не в долларах)
-          portfolios: список всех портфелей из БД
+          username: имя залогиненого пользователя (здесь нужен для логирования)
+    Raises:
+        ValueError: если код валюты не строка из трех латинских заглавных букв,
+                    или не удалось получить курс валют для конвертации,
+                    или нет кошелька в валюте покупки,
+                    или amount <= 0,
+                    или недоступен курс для конвертации валюты в базовую
+        InsufficientFundsError: если в кошельке недостаточно средств
+            для продажи amount единиц
+        CurrencyNotFoundError: Если код валюты не найден
     """
-    if not __check_login():
-        return
-    try:
-        __validate_currency_code(currency_code)
-    except ValueError as e:
-        print(e)
-        return
-    user_portfolio = __find_user_portfolio(portfolios)
-    if user_portfolio is None:
-        return
+    get_currency(currency_code)
 
-    try:
-        wallet = user_portfolio.get_wallet(currency_code)
-    except KeyError:
-        print(f"У вас нет кошелька '{currency_code}'. "
-              f"Добавьте валюту: она создаётся автоматически при первой покупке.")
-        return
+    with DatabaseManager().update_portfolios() as portfolios:
+        user_portfolio = __find_user_portfolio(portfolios, user_id)
 
-    try:
+        try:
+            wallet = user_portfolio.get_wallet(currency_code)
+        except KeyError:
+            raise ValueError(
+                f"У вас нет кошелька '{currency_code}'. "
+                f"Добавьте валюту: она создаётся автоматически при первой покупке."
+            )
+
         sum_before_withdraw = wallet.balance
         wallet.withdraw(amount)
-        rate = get_rate(
+        if wallet.balance == 0:
+            user_portfolio.remove_currency(wallet.currency_code)
+
+    base_currency = SettingsLoader().get(
+        key=SettingsLoader.DEFAULT_BASE_CURRENCY_KEY, default=__USD
+    )
+    try:
+        rate = __get_rate(
             from_currency_code=currency_code,
-            to_currency_code=USD
+            to_currency_code=base_currency,
+            base_currency=base_currency,
         )
-        converted_to_base = round(amount * rate, 2)
-        print(f"Продажа выполнена: {amount} {currency_code} "
-              f"по курсу {rate} USD/{currency_code}")
-        print("Изменения в портфеле:")
-        print(f"- {currency_code}: было {sum_before_withdraw} → стало {wallet.balance}")
-        print(f"Оценочная выручка: {converted_to_base:,.2f} USD")
     except KeyError:
-        print(f"Курс {currency_code}→USD недоступен. "
-              "Повторите попытку позже.")
-        return
-    except ValueError as e:
-        print(e)
-        return
+        raise ValueError(
+            f"Курс {currency_code}→{base_currency} недоступен. "
+            "Повторите попытку позже."
+        )
+
+    converted_to_base = amount * rate
+
+    return BuyOrSellResult(
+        rate=rate,
+        base_currency=base_currency,
+        total_cost=converted_to_base,
+        sum_before_operation=sum_before_withdraw,
+        sum_after_operation=wallet.balance,
+    )
 
 
 def __need_to_refresh_rates(rate_key: str, rates: dict[str, dict]) -> bool:
+    """
+    Проверяет, истёк ли TTL кэша курсов валют.
+    Args:
+        rate_key: ключ пары (например "RUB_USD")
+        rates: словарь с загруженными курсами
+    Returns:
+        True, если кэш истёк и нужно обновление
+    """
     rate_refresh_time = rates[rate_key][__UPDATED_AT_RATE_KEY]
-    return datetime.now() - rate_refresh_time > timedelta(minutes=__REFRESH_RATE_TIME_DELTA)
+    ttl_seconds = SettingsLoader().get(
+        key=SettingsLoader.RATES_TTL_SECONDS_KEY, default=300
+    )
+    return datetime.now() - rate_refresh_time > timedelta(seconds=ttl_seconds)
 
 
-def get_rate(from_currency_code: str, to_currency_code: str) -> float:
+def __get_rate(
+    from_currency_code: str, to_currency_code: str, base_currency: str
+) -> float:
     """
     Получить текущий курс одной валюты к другой.
+    Использует базовую валюту (USD) для вычисления кросс-курсов.
     Args:
-         from_currency_code: исходная валюта
-         to_currency_code: целевая валюта
+        from_currency_code: исходная валюта
+        to_currency_code: целевая валюта
+        base_currency: базовая валюта для конвертации
+    Returns:
+        Курс конвертации from -> to
     Raises:
         KeyError: если не нашли курса для конвертации указанных валют
     """
@@ -306,9 +323,10 @@ def get_rate(from_currency_code: str, to_currency_code: str) -> float:
 
     rates = load_rates()
 
-    if USD in (from_currency_code, to_currency_code):
-        # Если USD была одной из запрашиваемых валют, то просто ищем в справочнике
-        need_to_invert = from_currency_code == USD
+    if base_currency in (from_currency_code, to_currency_code):
+        # Если base_currency была одной из запрашиваемых,
+        # то просто ищем в справочнике
+        need_to_invert = from_currency_code == base_currency
         if need_to_invert:
             rate_key = f"{to_currency_code}_{from_currency_code}"
         else:
@@ -324,55 +342,57 @@ def get_rate(from_currency_code: str, to_currency_code: str) -> float:
 
         return rate
     else:
-        # Если запрашвается курс двух не USD валют, то вычисляем его через USD
-        rate_key_from_usd = f"{from_currency_code}_USD"
-        rate_key_to_usd = f"{to_currency_code}_USD"
+        # Если запрашвается курс двух не "базовых" валют, то вычисляем его через базовую
+        rate_key_from_base = f"{from_currency_code}_{base_currency}"
+        rate_key_to_base = f"{to_currency_code}_{base_currency}"
 
-        if (__need_to_refresh_rates(rate_key_from_usd, rates) or
-                __need_to_refresh_rates(rate_key_to_usd, rates)
-        ):
+        if __need_to_refresh_rates(
+            rate_key_from_base, rates
+        ) or __need_to_refresh_rates(rate_key_to_base, rates):
             rates = load_rates(fromCache=False)
 
-        rate_from_usd = rates[rate_key_from_usd][__RATE_KEY]
-        rate_to_usd = rates[rate_key_to_usd][__RATE_KEY]
+        rate_from_base = rates[rate_key_from_base][__RATE_KEY]
+        rate_to_base = rates[rate_key_to_base][__RATE_KEY]
 
-        rate_from_to = rate_from_usd / rate_to_usd
+        rate_from_to = rate_from_base / rate_to_base
 
         return rate_from_to
 
 
-def handle_get_rate_command(
-        from_currency_code: str,
-        to_currency_code: str,
-):
-    try:
-        __validate_currency_code(from_currency_code)
-        __validate_currency_code(to_currency_code)
-    except ValueError as e:
-        print(e)
-        return
+def get_rate(
+    from_code: str,
+    to_code: str,
+) -> tuple[float, datetime]:
+    """
+    Получить текущий курс одной валюты к другой
+    Args:
+        from_code: код валюты которую надо конвертировать
+        to_code: код валюты В которую надо конвертировать
+    Raises:
+        ValueError: Если не удалось получить курс валют для конвертации
+        CurrencyNotFoundError: Если код любой из валют не найден
+    """
+    get_currency(from_code)
+    get_currency(to_code)
+
+    base_currency = SettingsLoader().get(
+        key=SettingsLoader.DEFAULT_BASE_CURRENCY_KEY, default=__USD
+    )
 
     try:
-        rate_from_to = get_rate(from_currency_code, to_currency_code)
-        rate_to_from = get_rate(to_currency_code, from_currency_code)
-    except ValueError as e:
-        print(e)
-        return
+        rate_from_to = __get_rate(from_code, to_code, base_currency)
     except KeyError:
-        print(f"Курс {from_currency_code}→{to_currency_code} недоступен. Повторите попытку позже.")
-        return
+        raise ValueError(
+            f"Курс {from_code}→{to_code} недоступен. Повторите попытку позже."
+        )
 
     rates = load_rates()
 
-    if from_currency_code == to_currency_code or USD not in (from_currency_code, to_currency_code):
+    if from_code == to_code or base_currency not in (from_code, to_code):
         updated_at = datetime.now()
-    elif from_currency_code == USD:
-        updated_at = rates[f"{to_currency_code}_USD"][__UPDATED_AT_RATE_KEY]
+    elif from_code == base_currency:
+        updated_at = rates[f"{to_code}_{base_currency}"][__UPDATED_AT_RATE_KEY]
     else:
-        updated_at = rates[f"{from_currency_code}_USD"][__UPDATED_AT_RATE_KEY]
+        updated_at = rates[f"{from_code}_{base_currency}"][__UPDATED_AT_RATE_KEY]
 
-    print(f"Курс {from_currency_code}→{to_currency_code}: {rate_from_to} "
-          f"(обновлено {updated_at})")
-    # TODO надо как-то понять до скольки знаков округлять валюты.
-    #  BTC например может быть очень мелким, а вот USD, RUB - не может
-    print(f"Обратный курс {to_currency_code}→{from_currency_code}: {rate_to_from} ")
+    return rate_from_to, updated_at
