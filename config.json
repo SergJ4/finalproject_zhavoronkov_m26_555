@@ -1,0 +1,7 @@
+{
+  "DB_FOLDER": "data",
+  "RATES_TTL_SECONDS": 300,
+  "DEFAULT_BASE_CURRENCY": "USD",
+  "LOGS_PATH": "logs/actions.log",
+  "LOG_LEVEL": "INFO"
+}
