@@ -2,16 +2,21 @@ from functools import wraps
 from typing import Any, Callable
 
 from valutatrade_hub.core.models import BuyOrSellResult
+from valutatrade_hub.infra.settings import SettingsLoader
 from valutatrade_hub.logging_config import get_logger
 
-logger = get_logger("action_logger")
+__logger = get_logger(
+    "action_logger",
+    log_path=SettingsLoader().get(SettingsLoader.LOGS_PATH_KEY),
+)
+__logger.propagate = False
 
 
 def __find_arg_by_name(
-    argument_name: str,
-    func: Callable,
-    *args: Any,
-    **kwargs: Any,
+        argument_name: str,
+        func: Callable,
+        *args: Any,
+        **kwargs: Any,
 ) -> Any:
     """
     Ищем значение аргумента у функции
@@ -34,8 +39,8 @@ def __find_arg_by_name(
 
 
 def log_action(
-    action: str,
-    verbose: bool = False,
+        action: str,
+        verbose: bool = False,
 ):
     """
     Декоратор для логирования доменных операций.
@@ -78,7 +83,7 @@ def log_action(
                         log_data["wallet_change_before"] = result.sum_before_operation
                         log_data["wallet_change_after"] = result.sum_after_operation
                 message = __format_log_message(log_data)
-                logger.info(message)
+                __logger.info(message)
                 return result
 
             except Exception as exc:
@@ -86,7 +91,7 @@ def log_action(
                 log_data["error_type"] = type(exc).__name__
                 log_data["error_message"] = str(exc)
                 message = __format_log_message(log_data)
-                logger.error(message)
+                __logger.error(message)
                 raise
 
         return wrapper

@@ -1,15 +1,16 @@
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4 as uuid
 
 from valutatrade_hub.core.currencies import get_currency
-from valutatrade_hub.core.exceptions import UserNotFoundError
+from valutatrade_hub.core.exceptions import CurrencyNotFoundError, UserNotFoundError
 from valutatrade_hub.core.models import (
     BuyOrSellResult,
     Portfolio,
     ShowPortfolioResult,
     User,
 )
-from valutatrade_hub.core.utils import load_rates
+from valutatrade_hub.core.utils import get_rates_last_refresh, load_rates
 from valutatrade_hub.decorators import log_action
 from valutatrade_hub.infra.database import DatabaseManager
 from valutatrade_hub.infra.settings import SettingsLoader
@@ -300,7 +301,9 @@ def __need_to_refresh_rates(rate_key: str, rates: dict[str, dict]) -> bool:
     ttl_seconds = SettingsLoader().get(
         key=SettingsLoader.RATES_TTL_SECONDS_KEY, default=300
     )
-    return datetime.now() - rate_refresh_time > timedelta(seconds=ttl_seconds)
+    return datetime.now(timezone.utc) - rate_refresh_time > timedelta(
+        seconds=ttl_seconds
+    )
 
 
 def __get_rate(
@@ -308,55 +311,54 @@ def __get_rate(
 ) -> float:
     """
     Получить текущий курс одной валюты к другой.
-    Использует базовую валюту (USD) для вычисления кросс-курсов.
+    Внутренне всегда использует USD как базис для поиска курсов,
+    поскольку все курсы в rates.json хранятся против USD.
+
     Args:
         from_currency_code: исходная валюта
         to_currency_code: целевая валюта
-        base_currency: базовая валюта для конвертации
+        base_currency: базовая валюта для конвертации (игнорируется,
+            используется USD как внутренний базис)
     Returns:
         Курс конвертации from -> to
     Raises:
         KeyError: если не нашли курса для конвертации указанных валют
+        ApiRequestError: если не удалось получить курсы валют
     """
     if from_currency_code == to_currency_code:
         return 1
 
     rates = load_rates()
+    usd = __USD
 
-    if base_currency in (from_currency_code, to_currency_code):
-        # Если base_currency была одной из запрашиваемых,
-        # то просто ищем в справочнике
-        need_to_invert = from_currency_code == base_currency
-        if need_to_invert:
-            rate_key = f"{to_currency_code}_{from_currency_code}"
-        else:
-            rate_key = f"{from_currency_code}_{to_currency_code}"
-
+    # Поиск всегда по USD, т.к. все курсы хранятся как XXX_USD
+    if from_currency_code == usd:
+        # from=USD → ищем to_USD, инвертируем (1 / rate = USD per to)
+        rate_key = f"{to_currency_code}_{usd}"
         if __need_to_refresh_rates(rate_key, rates):
-            rates = load_rates(fromCache=False)
+            rates = load_rates(from_cache=False)
+        return 1 / rates[rate_key][__RATE_KEY]
 
-        rate = rates[rate_key][__RATE_KEY]
+    if to_currency_code == usd:
+        # to=USD → ищем from_USD напрямую
+        rate_key = f"{from_currency_code}_{usd}"
+        if __need_to_refresh_rates(rate_key, rates):
+            rates = load_rates(from_cache=False)
+        return rates[rate_key][__RATE_KEY]
 
-        if need_to_invert:
-            rate = 1 / rate
+    # Кросс-курс через USD: from_USD / to_USD
+    rate_key_from = f"{from_currency_code}_{usd}"
+    rate_key_to = f"{to_currency_code}_{usd}"
 
-        return rate
-    else:
-        # Если запрашвается курс двух не "базовых" валют, то вычисляем его через базовую
-        rate_key_from_base = f"{from_currency_code}_{base_currency}"
-        rate_key_to_base = f"{to_currency_code}_{base_currency}"
+    if __need_to_refresh_rates(
+        rate_key_from, rates
+    ) or __need_to_refresh_rates(rate_key_to, rates):
+        rates = load_rates(from_cache=False)
 
-        if __need_to_refresh_rates(
-            rate_key_from_base, rates
-        ) or __need_to_refresh_rates(rate_key_to_base, rates):
-            rates = load_rates(fromCache=False)
+    rate_from_usd = rates[rate_key_from][__RATE_KEY]
+    rate_to_usd = rates[rate_key_to][__RATE_KEY]
 
-        rate_from_base = rates[rate_key_from_base][__RATE_KEY]
-        rate_to_base = rates[rate_key_to_base][__RATE_KEY]
-
-        rate_from_to = rate_from_base / rate_to_base
-
-        return rate_from_to
+    return rate_from_usd / rate_to_usd
 
 
 def get_rate(
@@ -371,6 +373,7 @@ def get_rate(
     Raises:
         ValueError: Если не удалось получить курс валют для конвертации
         CurrencyNotFoundError: Если код любой из валют не найден
+        ApiRequestError: Если кэш устарел и не удалось обновить курсы
     """
     get_currency(from_code)
     get_currency(to_code)
@@ -389,10 +392,143 @@ def get_rate(
     rates = load_rates()
 
     if from_code == to_code or base_currency not in (from_code, to_code):
-        updated_at = datetime.now()
+        updated_at = datetime.now(timezone.utc)
     elif from_code == base_currency:
         updated_at = rates[f"{to_code}_{base_currency}"][__UPDATED_AT_RATE_KEY]
     else:
         updated_at = rates[f"{from_code}_{base_currency}"][__UPDATED_AT_RATE_KEY]
 
     return rate_from_to, updated_at
+
+
+@dataclass
+class UpdateRatesResult:
+    """Результат обновления курсов (команда update-rates)."""
+
+    total_rates: int
+    has_errors: bool
+
+
+@dataclass
+class ShowRatesResult:
+    """Данные для вывода списка курсов (команда show-rates)."""
+
+    header: str
+    rows: list[tuple[str, float]]
+
+
+def update_rates(
+    source: str | None = None,
+    console: bool = False,
+) -> UpdateRatesResult:
+    """
+    Запускает обновление курсов через Parser Service.
+
+    Args:
+        source: имя источника ("coingecko", "exchangerate") или None для всех.
+        console: подключать вывод логов в консоль
+    Returns:
+        UpdateRatesResult с количеством обновлённых курсов и флагом ошибок.
+    Raises:
+        ApiRequestError: если не удалось инициализировать обновление.
+    """
+    from valutatrade_hub.parser_service.updater import build_updater
+
+    report = build_updater(source=source, console=console).run_update()
+    return UpdateRatesResult(
+        total_rates=report.total_rates,
+        has_errors=report.has_errors,
+    )
+
+
+def show_rates(
+    currency: str | None = None,
+    top: int | None = None,
+    base: str | None = None,
+) -> ShowRatesResult:
+    """
+    Готовит данные для показа актуальных курсов из локального кеша.
+
+    Args:
+        currency: показать курс только для указанной валюты
+        top: показать N самых дорогих курсов
+        base: показать все курсы относительно указанной базы
+    Returns:
+        ShowRatesResult с заголовком (updated at ...) и строками (пара, курс).
+    Raises:
+        FileNotFoundError: если локальный кеш курсов пуст/не существует.
+    """
+    try:
+        rates = load_rates()
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "Локальный кеш курсов пуст. "
+            "Выполните 'update-rates', чтобы загрузить данные."
+        )
+
+    last_refresh = get_rates_last_refresh()
+    if last_refresh is not None:
+        header = (
+            f"Rates from cache (updated at "
+            f"{last_refresh.strftime('%Y-%m-%dT%H:%M:%S')}):"
+        )
+    else:
+        header = "Rates from cache:"
+
+    # Все пары вида "XXX_USD"
+    pairs = {
+        key: value
+        for key, value in rates.items()
+        if isinstance(value, dict) and __RATE_KEY in value
+    }
+
+    # Фильтрация по валюте
+    if currency:
+        currency = currency.upper()
+        matches = {
+            key: value for key, value in pairs.items()
+            if key.startswith(currency + "_") or key.endswith("_" + currency)
+        }
+        if not matches:
+            raise CurrencyNotFoundError(f"Курс для '{currency}' не найден в кеше.")
+        pairs = matches
+
+    # Вывод в выбранной базе: конвертируем "XXX_USD" -> "XXX_<base>"
+    display: dict[str, float] = {}
+    for key, value in pairs.items():
+        from_cur, to_cur = key.split("_")
+        rate_usd = value[__RATE_KEY]
+        if base:
+            base = base.upper()
+            # Пропускаем пары, где from_cur == base (это будет 1.0)
+            if from_cur == base:
+                continue
+            # Курс base к USD, чтобы пересчитать:
+            # rate_xxx_base = rate_xxx_usd / rate_base_usd
+            base_key = f"{base}_{to_cur}"
+            base_val = pairs.get(base_key) or pairs.get(f"{to_cur}_{base}")
+            if not base_val:
+                continue
+            base_rate_usd = base_val[__RATE_KEY]
+            display[f"{from_cur}_{base}"] = rate_usd / base_rate_usd
+
+        else:
+            display[key] = rate_usd
+
+    # Добавляем USD_base (обратный курс к base_USD)
+    if base and base != "USD":
+        usd_base_key = f"{base}_USD"
+        usd_base_val = pairs.get(usd_base_key)
+        if usd_base_val:
+            display[f"USD_{base}"] = 1.0 / usd_base_val[__RATE_KEY]
+
+    if not display:
+        raise ValueError("Не удалось рассчитать курсы для указанных фильтров.")
+
+    # --top: N самых дорогих
+    if top is not None:
+        items = sorted(display.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    else:
+        items = sorted(display.items())
+
+    return ShowRatesResult(header=header, rows=items)
