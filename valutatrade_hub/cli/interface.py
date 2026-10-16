@@ -1,7 +1,9 @@
 import shlex
+from typing import Any
 
 from valutatrade_hub.core import usecases
 from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
     CurrencyNotFoundError,
     InsufficientFundsError,
     UserNotFoundError,
@@ -41,9 +43,9 @@ def run():
         match command:
             case "register":
                 if (
-                    len(splitted_input) != 5
-                    or splitted_input[1] != "--username"
-                    or splitted_input[3] != "--password"
+                        len(splitted_input) != 5
+                        or splitted_input[1] != "--username"
+                        or splitted_input[3] != "--password"
                 ):
                     print(
                         "Комманда введена неверно. "
@@ -68,9 +70,9 @@ def run():
 
             case "login":
                 if (
-                    len(splitted_input) != 5
-                    or splitted_input[1] != "--username"
-                    or splitted_input[3] != "--password"
+                        len(splitted_input) != 5
+                        or splitted_input[1] != "--username"
+                        or splitted_input[3] != "--password"
                 ):
                     print(
                         "Комманда введена неверно. "
@@ -121,9 +123,9 @@ def run():
                     print("Сначала выполните login")
                     continue
                 if (
-                    len(splitted_input) != 5
-                    or splitted_input[1] != "--currency"
-                    or splitted_input[3] != "--amount"
+                        len(splitted_input) != 5
+                        or splitted_input[1] != "--currency"
+                        or splitted_input[3] != "--amount"
                 ):
                     print(
                         "Комманда введена неверно. "
@@ -161,9 +163,9 @@ def run():
                     print("Сначала выполните login")
                     continue
                 if (
-                    len(splitted_input) != 5
-                    or splitted_input[1] != "--currency"
-                    or splitted_input[3] != "--amount"
+                        len(splitted_input) != 5
+                        or splitted_input[1] != "--currency"
+                        or splitted_input[3] != "--amount"
                 ):
                     print(
                         "Комманда введена неверно. "
@@ -198,9 +200,9 @@ def run():
 
             case "get-rate":
                 if (
-                    len(splitted_input) != 5
-                    or splitted_input[1] != "--from"
-                    or splitted_input[3] != "--to"
+                        len(splitted_input) != 5
+                        or splitted_input[1] != "--from"
+                        or splitted_input[3] != "--to"
                 ):
                     print(
                         "Комманда введена неверно. 'get-rate --from <str> --to <str>'"
@@ -214,14 +216,95 @@ def run():
                         to_code=to_code,
                     )
                     print(
-                        f"Курс {from_code}→{to_code}: {rate} (обновлено {updated_at})"
+                        f"Курс {from_code}→{to_code}: {rate} "
+                        f"(обновлено: {updated_at.strftime('%Y-%m-%d %H:%M:%S')})"
                     )
                     # TODO надо как-то понять до скольки знаков округлять валюты.
                     #  BTC например может быть очень мелким, а вот USD, RUB - не может
                     print(f"Обратный курс {to_code}→{from_code}: {1 / rate} ")
-                except (ValueError, CurrencyNotFoundError) as e:
+                except (ValueError, CurrencyNotFoundError, ApiRequestError) as e:
                     print(e)
+            case "update-rates":
+                # update-rates [--source coingecko|exchangerate]
+                source = None
+                if len(splitted_input) == 3 and splitted_input[1] == "--source":
+                    source = splitted_input[2]
+                elif len(splitted_input) != 1:
+                    print(
+                        "Комманда введена неверно. "
+                        "'update-rates [--source coingecko|exchangerate]'"
+                    )
+                    continue
+                try:
+                    report = usecases.update_rates(
+                        source=source, console=True
+                    )
+                    if report.has_errors:
+                        print(
+                            "Update completed with errors. "
+                            "Check logs/parser.log for details. "
+                            f"Updated {report.total_rates} rates."
+                        )
+                    else:
+                        print(
+                            f"Update successful. "
+                            f"Total rates updated: {report.total_rates}."
+                        )
+                except ApiRequestError as e:
+                    print(e)
+            case "show-rates":
+                # show-rates [--currency <str>] [--top <int>] [--base <str>]
+                base, currency, top, valid = __parse_show_rates_command(splitted_input)
+                if not valid:
+                    print(
+                        "Комманда введена неверно. "
+                        "'show-rates [--currency <str>] [--top <int>] [--base <str>]'"
+                    )
+                    continue
+                try:
+                    rates_result = usecases.show_rates(
+                        currency=currency,
+                        top=top,
+                        base=base
+                    )
+                    print(rates_result.header)
+                    for key, rate in rates_result.rows:
+                        print(f"- {key}: {rate}")
+                except (ValueError, CurrencyNotFoundError, FileNotFoundError) as e:
+                    print(e)
+
             case "exit":
                 break
             case _:
                 print(f"Неизвесная команда: {command}")
+
+
+def __parse_show_rates_command(
+        splitted_input: list[Any] | list[str],
+) -> tuple[Any, Any, Any, bool]:
+    currency = None
+    top = None
+    base = None
+    i = 1
+    valid = True
+    while i < len(splitted_input):
+        flag = splitted_input[i]
+        if i + 1 >= len(splitted_input):
+            valid = False
+            break
+        value = splitted_input[i + 1]
+        if flag == "--currency":
+            currency = value
+        elif flag == "--top":
+            try:
+                top = int(value)
+            except ValueError:
+                valid = False
+                break
+        elif flag == "--base":
+            base = value
+        else:
+            valid = False
+            break
+        i += 2
+    return base, currency, top, valid

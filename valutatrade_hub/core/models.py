@@ -194,17 +194,17 @@ class Wallet:
         return self._balance
 
     @balance.setter
-    def balance(self, amount: float):
+    def balance(self, amount: float | int):
         """
         Устанавливает баланс кошелька.
         Raises:
             ValueError: если amount не float или отрицательное
         """
-        if not isinstance(amount, float) or amount < 0:
+        if not isinstance(amount, (float, int)) or amount < 0:
             raise ValueError("'amount' должен быть положительным числом")
         self._balance = amount
 
-    def deposit(self, amount: float):
+    def deposit(self, amount: float | int):
         """
         Увеличивает сумму в кошельке.
         Args:

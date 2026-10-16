@@ -104,12 +104,20 @@ __CURRENCY_REGISTRY: dict[str, Currency] = {
     "USD": FiatCurrency(name="US Dollar", code="USD", issuing_country="United States"),
     "EUR": FiatCurrency(name="Euro", code="EUR", issuing_country="European Union"),
     "RUB": FiatCurrency(name="Ruble", code="RUB", issuing_country="Russian Federation"),
+    "GBP": FiatCurrency(
+        name="Pound Sterling",
+        code="GBP",
+        issuing_country="United Kingdom",
+    ),
     "BTC": CryptoCurrency(
         name="Bitcoin", code="BTC", algorithm="SHA-256", market_cap=1000000
     ),
     "ETH": CryptoCurrency(
-        name="Etherium", code="ETH", algorithm="SHA-256", market_cap=10000
+        name="Etherium", code="ETH", algorithm="Ethash", market_cap=10000
     ),
+    "SOL": CryptoCurrency(
+        name="Solana", code="SOL", algorithm="Ethash", market_cap=1000
+    )
 }
 
 

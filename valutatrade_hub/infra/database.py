@@ -1,8 +1,7 @@
 import json
-import os
 from contextlib import contextmanager
+from pathlib import Path
 
-from valutatrade_hub.core.exceptions import UserNotFoundError
 from valutatrade_hub.core.models import Portfolio, User
 from valutatrade_hub.core.utils import safe_write_json
 from valutatrade_hub.infra.settings import SettingsLoader
@@ -27,9 +26,10 @@ class DatabaseManager:
     def __init__(self):
         if self.__initialized:
             return
-        self.__database_folder = SettingsLoader().get(SettingsLoader.DB_FOLDER_KEY)
-        self.__users_path = os.path.join(self.__database_folder, "users.json")
-        self.__portfolios_path = os.path.join(self.__database_folder, "portfolios.json")
+        db_folder = SettingsLoader().get(SettingsLoader.DB_FOLDER_KEY)
+        self.__database_folder = Path(db_folder)
+        self.__users_path = self.__database_folder / "users.json"
+        self.__portfolios_path = self.__database_folder / "portfolios.json"
         self.__initialized = True
 
     def load_users(self) -> list[User]:
@@ -38,7 +38,7 @@ class DatabaseManager:
         Returns:
             Список объектов User. Пустой список, если файл не найден.
         """
-        if not os.path.exists(self.__users_path):
+        if not self.__users_path.exists():
             return []
 
         with open(self.__users_path, "r") as f:
@@ -51,8 +51,8 @@ class DatabaseManager:
         Args:
             users: список объектов User для сохранения
         """
-        os.makedirs(self.__database_folder, exist_ok=True)
-        safe_write_json(self.__users_path, [user.to_dict() for user in users])
+        self.__database_folder.mkdir(parents=True, exist_ok=True)
+        safe_write_json(str(self.__users_path), [user.to_dict() for user in users])
 
     @contextmanager
     def update_users(self):
@@ -77,7 +77,7 @@ class DatabaseManager:
         Returns:
             Список объектов Portfolio. Пустой список, если файл не найден.
         """
-        if not os.path.exists(self.__portfolios_path):
+        if not self.__portfolios_path.exists():
             return []
         with open(self.__portfolios_path, "r") as f:
             portfolios = json.load(f)
@@ -91,9 +91,9 @@ class DatabaseManager:
         Args:
             portfolios: список объектов Portfolio для сохранения
         """
-        os.makedirs(self.__database_folder, exist_ok=True)
+        self.__database_folder.mkdir(parents=True, exist_ok=True)
         data = [portfolio.to_dict() for portfolio in portfolios]
-        safe_write_json(self.__portfolios_path, data)
+        safe_write_json(str(self.__portfolios_path), data)
 
     @contextmanager
     def update_portfolios(self):

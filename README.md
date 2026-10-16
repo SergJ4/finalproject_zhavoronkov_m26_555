@@ -1,3 +1,149 @@
+# Valutatrade Hub
+
+Valutatrade Hub — CLI-приложение для управления валютным портфелем пользователя. Поддерживает регистрацию и аутентификацию, покупку/продажу валюты, конвертацию по актуальным курсам, а также автоматическое обновление курсов из внешних API (CoinGecko, ExchangeRate-API).
+
+## Структура проекта
+
+```
+├── valutatrade_hub/
+│   ├── cli/              # Интерфейс командной строки (оркестрация)
+│   ├── core/             # Бизнес-логика (модели, usecases, утилиты)
+│   ├── infra/            # Инфраструктура (БД, настройки)
+│   └── parser_service/   # Парсер внешних API курсов валют
+├── data/                 # Базы данных (users.json, portfolios.json, rates.json)
+├── logs/                 # Логи (actions.log, parser.log)
+├── config.json           # Конфигурация приложения
+├── main.py               # Точка входа
+└── pyproject.toml        # Зависимости и метаданные
+```
+
+## Установка
+
+Проект использует [uv](https://github.com/astral-sh/uv) для управления зависимостями.
+
+```bash
+# Установка зависимостей
+uv sync
+```
+
+Если uv не установлен:
+```bash
+pip install uv
+uv sync
+```
+
+## Запуск
+
+```bash
+uv run python main.py
+```
+
+После запуска введите команду (например, `register`, `login`, `exit`). Введите `help` для списка доступных команд.
+
+---
+
+# Parser Service — обновление курсов валют
+
+Parser Service загружает актуальные курсы валют из внешних API и сохраняет их в локальный кэш.
+
+## Команды
+
+### update-rates
+
+Загружает курсы из всех доступных источников (или из указанного).
+
+**Команда**: `update-rates [--source coingecko|exchangerate]`
+
+**Примеры**:
+```bash
+# Обновить из всех источников
+update-rates
+
+# Обновить только из CoinGecko
+update-rates --source coingecko
+
+# Обновить только из ExchangeRate-API
+update-rates --source exchangerate
+```
+
+**Пример вывода**:
+```
+INFO: Starting rates update...
+INFO: Fetching from CoinGecko... OK (3 rates) [1.23s]
+INFO: Fetching from ExchangeRate-API... OK (3 rates) [0.87s]
+Update successful. Total rates updated: 6.
+```
+
+При ошибке одного из источников:
+```
+ERROR: Failed to fetch from CoinGecko: Network error.
+INFO: Fetching from ExchangeRate-API... OK (3 rates)
+Update completed with errors. Check logs/parser.log for details.
+```
+
+### show-rates
+
+Показывает текущие курсы из локального кэша.
+
+**Команда**: `show-rates [--currency <str>] [--top <int>] [--base <str>]`
+
+**Параметры**:
+| Параметр | Описание |
+|----------|----------|
+| `--currency <str>` | Показать курс только для указанной валюты |
+| `--top <int>` | Показать N самых дорогих курсов |
+| `--base <str>` | Показать все курсы относительно указанной базы |
+
+**Примеры**:
+```bash
+# Все курсы
+show-rates
+
+# Только BTC
+show-rates --currency BTC
+
+# Топ-3 самых дорогих
+show-rates --top 3
+
+# Курсы относительно RUB
+show-rates --base RUB
+```
+
+## Кэш и TTL
+
+Курсы хранятся в `data/rates.json` с метаданными `updated_at` для каждой пары.
+
+- **TTL** (время жизни кэша) задаётся в `config.json` ключом `RATES_TTL_SECONDS` (по умолчанию **300 секунд** = 5 минут).
+- При запросе курса (`get-rate`, `show-portfolio`) система проверяет TTL. Если кэш истёк — автоматически перезагружает из файла.
+- Для принудительного обновления выполните `update-rates`.
+
+Если кэш пуст (первый запуск), команды `get-rate` и `show-portfolio` выведут:
+```
+Локальный кеш курсов пуст. Выполните 'update-rates', чтобы загрузить данные.
+```
+
+## API ключи
+
+### ExchangeRate-API
+
+Для работы ExchangeRate-API необходим бесплатный API ключ.
+
+**Установка**:
+1. Зарегистрируйтесь на [exchangerate-api.com](https://www.exchangerate-api.com/)
+2. Получите API ключ в панели управления
+3. Установите как переменную окружения:
+   ```bash
+   export EXCHANGERATE_API_KEY="ваш_ключ"
+   ```
+
+Без ключа клиент ExchangeRate-API пропустит инициализацию, но CoinGecko продолжит работать.
+
+### CoinGecko
+
+CoinGecko не требует API ключа для базового использования (есть лимиты на запросы).
+
+---
+
 # Управление пользователями
 
 ## Регистрация
@@ -266,3 +412,6 @@ ERROR 2025-10-09T12:06:10 SELL user='alice' currency='EUR' amount=100.0000
  result=ERROR error_type=InsufficientFundsError 
  error_message='Недостаточно средств: доступно 50.0 EUR, требуется 100.0 EUR'
 ```
+# Демо
+
+[![asciicast](https://asciinema.org/a/v9NpzrZBgKEOP6zF.svg)](https://asciinema.org/a/v9NpzrZBgKEOP6zF)
